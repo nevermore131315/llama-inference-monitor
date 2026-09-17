@@ -19,7 +19,7 @@ Everything auto-refreshes: SSE for live metrics, 2s activity polling, 10s stats 
 
 - Hermes Desktop app
 - [llama-swap](https://github.com/MostlyWhat/llama-swap) running locally with metrics/activity enabled
-- Tested against llama-swap v255 / Hermes Desktop 0.180.x
+- Tested against llama-swap v255 on Hermes Desktop 0.17.4 (Hermes Agent 0.21.3, commit 6005aa1)
 
 ## Install
 
