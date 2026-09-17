@@ -13,7 +13,7 @@ A [Hermes Desktop](https://hermes-agent.nousresearch.com) plugin that puts a liv
 - **Decode sparkline** — recent request speeds at a glance
 - **Recent Requests table** — per-request model, decode, prefill, and **MTP speculative-decoding acceptance rate** (draft accepted / draft proposed)
 
-Everything auto-refreshes: SSE for live metrics, 2s activity polling, 10s stats polling. If the stream drops, the header dot goes red and polling keeps the dashboard useful.
+Everything auto-refreshes: SSE for live metrics, 2s activity polling, 10s stats polling. If the stream drops, the header dot goes red and polling keeps the dashboard useful. Live values older than 30s fade to gray — a frozen reading never masquerades as a current one.
 
 ## Requirements
 

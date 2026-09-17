@@ -24,7 +24,8 @@ const timeAgo = (ts) => {
   const d = Date.now() - ts;
   if (d < 5000) return "just now";
   if (d < 60000) return `${Math.floor(d / 1000)}s ago`;
-  return `${Math.floor(d / 60000)}m ago`;
+  if (d < 3600000) return `${Math.floor(d / 60000)}m ago`;
+  return `${Math.floor(d / 3600000)}h ago`;
 };
 
 // --- styles ---
@@ -38,6 +39,10 @@ const muted = { color: "var(--muted-foreground, #9ca3af)" };
 const GREEN = "#4ade80";
 const BLUE = "#60a5fa";
 const PURPLE = "#a78bfa";
+// A live value older than this fades to gray: a frozen number must never
+// look like a current one (a quiet SSE stream keeps the LAST value — it
+// never resets it, so staleness must be rendered, not assumed).
+const STALE_MS = 30000;
 
 // --- Sparkline ---
 
@@ -75,7 +80,7 @@ function Sparkline({ data, width = 420, height = 60, color = GREEN }) {
 
 // --- Metric card ---
 
-function MetricCard({ label, value, sub, accent }) {
+function MetricCard({ label, value, sub, accent, stale }) {
   return el("div", { style: { ...card, padding: "10px 12px" } }, [
     el(
       "div",
@@ -92,7 +97,14 @@ function MetricCard({ label, value, sub, accent }) {
     ),
     el(
       "div",
-      { key: "v", style: { fontSize: 22, fontWeight: 700, color: accent || "inherit" } },
+      {
+        key: "v",
+        style: {
+          fontSize: 22,
+          fontWeight: 700,
+          color: stale ? "var(--muted-foreground, #9ca3af)" : accent || "inherit",
+        },
+      },
       value
     ),
     sub
@@ -144,6 +156,15 @@ function LlamaMonitor() {
     lastActivityUpdate: null,
     stats: null,
   });
+
+  // In-flight fetches may resolve after unmount; never setState on a dead component.
+  const aliveRef = useRef(true);
+  useEffect(
+    () => () => {
+      aliveRef.current = false;
+    },
+    []
+  );
 
   // --- SSE: llama-swap /api/events emits everything on the default "message"
   // channel as {type, data} envelopes; data is a JSON string needing a 2nd parse. ---
@@ -257,6 +278,7 @@ function LlamaMonitor() {
           timestamp: row.timestamp,
         };
       });
+      if (!aliveRef.current) return;
       setState((s) => ({
         ...s,
         recentRequests: requests,
@@ -265,7 +287,7 @@ function LlamaMonitor() {
         currentModel: s.currentModel || (requests[0] && requests[0].model) || null,
       }));
     } catch (e) {
-      setState((s) => ({ ...s, activityError: e.message }));
+      if (aliveRef.current) setState((s) => ({ ...s, activityError: e.message }));
     }
   }, []);
 
@@ -274,7 +296,7 @@ function LlamaMonitor() {
       const resp = await fetch(`${BASE}/api/metrics/stats`);
       if (!resp.ok) return;
       const data = await resp.json();
-      setState((s) => ({ ...s, stats: data }));
+      if (aliveRef.current) setState((s) => ({ ...s, stats: data }));
     } catch {
       /* ignore */
     }
@@ -359,6 +381,7 @@ function LlamaMonitor() {
           key: "c1",
           label: "Live Decode",
           accent: GREEN,
+          stale: state.liveDecodeAt != null && Date.now() - state.liveDecodeAt > STALE_MS,
           value: formatTokS(state.liveDecodeTps),
           sub: state.liveDecodeAt != null ? timeAgo(state.liveDecodeAt) : "waiting for generation",
         }),
@@ -366,6 +389,7 @@ function LlamaMonitor() {
           key: "c2",
           label: "Live Prefill",
           accent: BLUE,
+          stale: state.livePrefillAt != null && Date.now() - state.livePrefillAt > STALE_MS,
           value: formatTokS(state.livePrefillTps),
           sub:
             state.livePrefillAt != null
