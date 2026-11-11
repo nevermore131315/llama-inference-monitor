@@ -172,6 +172,7 @@ function LlamaMonitor() {
   useEffect(() => {
     let closed = false;
     let es;
+    let esLog;
 
     const applyModelStatus = (raw) => {
       try {
@@ -203,6 +204,13 @@ function LlamaMonitor() {
         if (typeof blob !== "string" || !blob) return;
         // upstream frames arrive BATCHED (many lines per frame) — keep last match.
         let tg = null, pp = null, nt = null;
+        // NInfer prints "2.46k" style rates; llama.cpp prints plain numbers.
+        const num = (s) => {
+          const m = String(s).replace(/,/g, "").match(/^([0-9.]+)\s*([kKmM]?)$/);
+          if (!m) return null;
+          const mult = { k: 1e3, K: 1e3, m: 1e6, M: 1e6 }[m[2]] || 1;
+          return parseFloat(m[1]) * mult;
+        };
         for (const line of blob.split("\n")) {
           const m1 = line.match(/tg_3s\s*=\s*([0-9.]+)/);
           if (m1) tg = parseFloat(m1[1]);
@@ -213,6 +221,54 @@ function LlamaMonitor() {
             const m3 = line.match(/n_tokens\s*=\s*([0-9]+)/);
             if (m3) nt = parseInt(m3[1], 10);
           }
+          // NInfer (2026-09-24): periodic window line, e.g.
+          // "throughput | 5.0s | prefill 2.46k tok/s (12,288 tok) | decode 69.0 tok/s (345 tok) | running 1 (prefill 1) | ..."
+          // Windows are mixed (a window can straddle prefill->decode), so only
+          // trust a rate when its window did real work of that kind.
+          if (line.includes("throughput |")) {
+            const pf = line.match(/prefill\s+([0-9.,]+\s*[kKmM]?)\s*tok\/s\s*\(([0-9,]+)\s*tok\)/);
+            const dc = line.match(/decode\s+([0-9.,]+\s*[kKmM]?)\s*tok\/s\s*\(([0-9,]+)\s*tok\)/);
+            const prefilling = /running\s+\d+\s*\(prefill/.test(line);
+            if (pf) {
+              const n = parseInt(pf[2].replace(/,/g, ""), 10);
+              if (n >= 1024 || (prefilling && n > 0)) pp = num(pf[1]);
+            }
+            if (dc) {
+              const n = parseInt(dc[2].replace(/,/g, ""), 10);
+              if (n >= 32 && !prefilling) tg = num(dc[1]);
+            }
+          }
+          // NInfer per-request summary: "req#4 done | ... | prompt 107,650 | ... | prefill 1.38k tok/s | decode 61.8 tok/s | ..."
+          if (/req#\d+ done \|/.test(line)) {
+            const rp = line.match(/\|\s*prompt\s+([0-9,]+)\s*\|/);
+            const rpf = line.match(/\|\s*prefill\s+([0-9.,]+\s*[kKmM]?)\s*tok\/s/);
+            const rdc = line.match(/\|\s*decode\s+([0-9.,]+\s*[kKmM]?)\s*tok\/s/);
+            if (rp) nt = parseInt(rp[1].replace(/,/g, ""), 10);
+            if (rpf) pp = num(rpf[1]);
+            if (rdc) tg = num(rdc[1]);
+          }
+          // Strata (2026-11-01): human-readable engine lines, three kinds.
+          // Per-request summary — the authoritative prefill+decode pair:
+          // "[strata] request prompt 74970 cached 65536 output 244 prompt_read 900 ms total 3200 ms prefill 83.3 tok/s decode 109.4 tok/s"
+          if (line.includes("[strata] request prompt")) {
+            const sp = line.match(/prompt\s+([0-9,]+)\s+cached/);
+            const spf = line.match(/prefill\s+([0-9.]+)\s+tok\/s/);
+            const sdc = line.match(/decode\s+([0-9.]+)\s+tok\/s/);
+            if (sp) nt = parseInt(sp[1].replace(/,/g, ""), 10);
+            if (spf) pp = parseFloat(spf[1]);
+            if (sdc) tg = parseFloat(sdc[1]);
+          }
+          // Live progress: "answering:|thinking:|writing a tool call: ... tokens, 101.2 tok/s, 249 s"
+          // (thinking lines are reasoning-token decode — same rate, still decode.)
+          const stm = line.match(/\[strata\] (?:answering|thinking|writing a tool call).*tokens,\s*([0-9.]+)\s+tok\/s/);
+          if (stm) tg = parseFloat(stm[1]);
+          // Completion: "done: 26097 tokens in 255 s (102.7 tok/s) ..."
+          const sdn = line.match(/\[strata\] done:\s*([0-9,]+)\s+tokens in\s+[0-9.]+\s+s\s*\(([0-9.]+)\s+tok\/s\)/);
+          if (sdn) tg = parseFloat(sdn[2]);
+          // Prefill progress (no rate emitted, only the token count):
+          // "reading the prompt: 74,970 of 74,975 tokens, 2 s so far"
+          const spr = line.match(/\[strata\] reading the prompt:\s*([0-9,]+)\s+of/);
+          if (spr) nt = parseInt(spr[1].replace(/,/g, ""), 10);
         }
         if (tg != null || pp != null)
           setState((s) => ({
@@ -243,6 +299,20 @@ function LlamaMonitor() {
             /* ignore */
           }
         };
+
+        // Upstream llama.cpp stdout (tg_3s, prompt processing) is served on
+        // /api/events/logs?stream=upstream — NOT on /api/events (which only
+        // carries modelStatus/inflight/activity). Subscribe here so the live
+        // decode/prefill cards actually populate.
+        esLog = new EventSource(`${BASE}/api/events/logs?stream=upstream`);
+        esLog.onmessage = (e) => {
+          try {
+            const d = JSON.parse(e.data);
+            if (d.type === "logData") applyLog(e.data);
+          } catch {
+            /* ignore */
+          }
+        };
       } catch {
         setState((s) => ({ ...s, streamConnected: false }));
       }
@@ -252,6 +322,7 @@ function LlamaMonitor() {
     return () => {
       closed = true;
       if (es) es.close();
+      if (esLog) esLog.close();
     };
   }, []);
 
