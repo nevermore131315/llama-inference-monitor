@@ -19,7 +19,7 @@ const formatTokS = (v) => {
   return v >= 1000 ? `${Math.round(v)} tok/s` : `${v.toFixed(1)} tok/s`;
 };
 const formatPct = (v) =>
-  v == null || !isFinite(v) || v === 0 ? "--" : `${(v * 100).toFixed(1)}%`;
+  v == null || !isFinite(v) ? "--" : `${(v * 100).toFixed(1)}%`;
 const timeAgo = (ts) => {
   const d = Date.now() - ts;
   if (d < 5000) return "just now";
@@ -43,6 +43,14 @@ const PURPLE = "#a78bfa";
 // look like a current one (a quiet SSE stream keeps the LAST value — it
 // never resets it, so staleness must be rendered, not assumed).
 const STALE_MS = 30000;
+// On subscribe llama-swap replays its whole upstream log buffer as the first
+// frame. Those lines carry no timestamps, so nothing in a frame that lands
+// this soon after the stream opens can honestly be stamped "now".
+const REPLAY_MS = 1000;
+const AMBER = "#fbbf24";
+// EventSource retries a dropped connection by itself, but gives up for good
+// (readyState CLOSED) on a non-200 or wrong content type. Re-open those.
+const WATCHDOG_MS = 5000;
 
 // --- Sparkline ---
 
@@ -145,12 +153,15 @@ function ActivityRow({ req }) {
 function LlamaMonitor() {
   const [state, setState] = useState({
     streamConnected: false,
+    logStreamConnected: false,
     currentModel: null,
+    modelKnown: false, // false until the first modelStatus frame arrives
     liveDecodeTps: null,
     liveDecodeAt: null,
     livePrefillTps: null,
     livePrefillAt: null,
     livePromptTokens: null,
+    livePromptAt: null,
     recentRequests: [],
     activityError: null,
     lastActivityUpdate: null,
@@ -171,8 +182,10 @@ function LlamaMonitor() {
 
   useEffect(() => {
     let closed = false;
-    let es;
-    let esLog;
+    let es = null;
+    let esLog = null;
+    let logOpenedAt = 0;
+    let logFirstFrame = true;
 
     const applyModelStatus = (raw) => {
       try {
@@ -180,11 +193,16 @@ function LlamaMonitor() {
         let models = env.data;
         if (typeof models === "string") models = JSON.parse(models);
         if (Array.isArray(models)) {
-          const ready =
-            models.find((m) => String(m.state || "").toLowerCase() === "ready" && !m.unlisted) ||
-            models.find((m) => String(m.state || "").toLowerCase() === "ready");
-          const id = ready && (ready.id || ready.name);
-          if (id) setState((s) => ({ ...s, currentModel: id }));
+          // Every ready model (a group can hold several), and null when none
+          // is: an unload has to clear the card, not leave the last name up.
+          const ready = models.filter((m) => String(m.state || "").toLowerCase() === "ready");
+          const listed = ready.filter((m) => !m.unlisted);
+          const ids = (listed.length ? listed : ready).map((m) => m.id || m.name).filter(Boolean);
+          setState((s) => ({
+            ...s,
+            currentModel: ids.length ? ids.join(", ") : null,
+            modelKnown: true,
+          }));
         }
       } catch {
         /* ignore malformed frames */
@@ -229,13 +247,19 @@ function LlamaMonitor() {
             const pf = line.match(/prefill\s+([0-9.,]+\s*[kKmM]?)\s*tok\/s\s*\(([0-9,]+)\s*tok\)/);
             const dc = line.match(/decode\s+([0-9.,]+\s*[kKmM]?)\s*tok\/s\s*\(([0-9,]+)\s*tok\)/);
             const prefilling = /running\s+\d+\s*\(prefill/.test(line);
+            // "running 0" = the request ended inside this window, so its
+            // tokens are averaged over dead time and the rate is deflated
+            // (seen: "decode 112.2 tok/s ... running 1" then
+            // "decode 31.6 tok/s (158 tok) ... running 0").
+            const run = line.match(/running\s+(\d+)/);
+            const idle = run != null && parseInt(run[1], 10) === 0;
             if (pf) {
               const n = parseInt(pf[2].replace(/,/g, ""), 10);
               if (n >= 1024 || (prefilling && n > 0)) pp = num(pf[1]);
             }
             if (dc) {
               const n = parseInt(dc[2].replace(/,/g, ""), 10);
-              if (n >= 32 && !prefilling) tg = num(dc[1]);
+              if (n >= 32 && !prefilling && !idle) tg = num(dc[1]);
             }
           }
           // NInfer per-request summary: "req#4 done | ... | prompt 107,650 | ... | prefill 1.38k tok/s | decode 61.8 tok/s | ..."
@@ -270,19 +294,24 @@ function LlamaMonitor() {
           const spr = line.match(/\[strata\] reading the prompt:\s*([0-9,]+)\s+of/);
           if (spr) nt = parseInt(spr[1].replace(/,/g, ""), 10);
         }
-        if (tg != null || pp != null)
+        // A token count with no rate is still news: Strata reports prefill
+        // progress that way ("reading the prompt: N of M") and prints the
+        // rate only once the request is done.
+        if (tg != null || pp != null || nt != null) {
+          const now = Date.now(); // one stamp, so same-frame values compare equal
           setState((s) => ({
             ...s,
-            ...(tg != null && { liveDecodeTps: tg, liveDecodeAt: Date.now() }),
-            ...(pp != null && { livePrefillTps: pp, livePrefillAt: Date.now() }),
-            ...(nt != null && { livePromptTokens: nt }),
+            ...(tg != null && { liveDecodeTps: tg, liveDecodeAt: now }),
+            ...(pp != null && { livePrefillTps: pp, livePrefillAt: now }),
+            ...(nt != null && { livePromptTokens: nt, livePromptAt: now }),
           }));
+        }
       } catch {
         /* ignore malformed frames */
       }
     };
 
-    const connect = () => {
+    const openEvents = () => {
       if (closed) return;
       try {
         es = new EventSource(`${BASE}/api/events`);
@@ -299,28 +328,63 @@ function LlamaMonitor() {
             /* ignore */
           }
         };
+      } catch {
+        es = null;
+        setState((s) => ({ ...s, streamConnected: false }));
+      }
+    };
 
-        // Upstream llama.cpp stdout (tg_3s, prompt processing) is served on
-        // /api/events/logs?stream=upstream — NOT on /api/events (which only
-        // carries modelStatus/inflight/activity). Subscribe here so the live
-        // decode/prefill cards actually populate.
+    // Upstream engine stdout (tg_3s, prompt processing, [strata] ...) is
+    // served on /api/events/logs?stream=upstream — NOT on /api/events (which
+    // only carries modelStatus/inflight/...). Without this subscription the
+    // live decode/prefill cards never populate.
+    const openLogs = () => {
+      if (closed) return;
+      try {
         esLog = new EventSource(`${BASE}/api/events/logs?stream=upstream`);
+        // onopen fires on every (re)connect, so each one re-arms the replay guard.
+        esLog.onopen = () => {
+          logOpenedAt = Date.now();
+          logFirstFrame = true;
+          setState((s) => ({ ...s, logStreamConnected: true }));
+        };
+        esLog.onerror = () => setState((s) => ({ ...s, logStreamConnected: false }));
         esLog.onmessage = (e) => {
           try {
             const d = JSON.parse(e.data);
-            if (d.type === "logData") applyLog(e.data);
+            if (d.type !== "logData") return;
+            // The first frame after a connect is the replayed history buffer:
+            // old lines, no timestamps. Drop it rather than stamp it "now".
+            const replay = logFirstFrame && Date.now() - logOpenedAt < REPLAY_MS;
+            logFirstFrame = false;
+            if (!replay) applyLog(e.data);
           } catch {
             /* ignore */
           }
         };
       } catch {
-        setState((s) => ({ ...s, streamConnected: false }));
+        esLog = null;
+        setState((s) => ({ ...s, logStreamConnected: false }));
       }
     };
 
-    connect();
+    openEvents();
+    openLogs();
+    const watchdog = setInterval(() => {
+      if (closed) return;
+      if (!es || es.readyState === 2) {
+        if (es) es.close();
+        openEvents();
+      }
+      if (!esLog || esLog.readyState === 2) {
+        if (esLog) esLog.close();
+        openLogs();
+      }
+    }, WATCHDOG_MS);
+
     return () => {
       closed = true;
+      clearInterval(watchdog);
       if (es) es.close();
       if (esLog) esLog.close();
     };
@@ -355,7 +419,6 @@ function LlamaMonitor() {
         recentRequests: requests,
         activityError: null,
         lastActivityUpdate: Date.now(),
-        currentModel: s.currentModel || (requests[0] && requests[0].model) || null,
       }));
     } catch (e) {
       if (aliveRef.current) setState((s) => ({ ...s, activityError: e.message }));
@@ -424,11 +487,19 @@ function LlamaMonitor() {
                 height: 8,
                 borderRadius: "50%",
                 display: "inline-block",
-                background: state.streamConnected ? GREEN : "#f87171",
+                background: !state.streamConnected
+                  ? "#f87171"
+                  : !state.logStreamConnected
+                  ? AMBER
+                  : GREEN,
               },
             }),
             el("span", { key: "lbl", style: muted },
-              state.streamConnected ? "stream connected" : "stream down (polling)"),
+              !state.streamConnected
+                ? "stream down (polling)"
+                : !state.logStreamConnected
+                ? "log stream down (live cards frozen)"
+                : "streams connected"),
           ]
         ),
       ]
@@ -463,7 +534,10 @@ function LlamaMonitor() {
           stale: state.livePrefillAt != null && Date.now() - state.livePrefillAt > STALE_MS,
           value: formatTokS(state.livePrefillTps),
           sub:
-            state.livePrefillAt != null
+            state.livePromptAt != null && state.livePromptAt > (state.livePrefillAt || 0)
+              ? // a token count newer than the last rate = a prompt being read now
+                `reading prompt · ${state.livePromptTokens.toLocaleString()} tok · ${timeAgo(state.livePromptAt)}`
+              : state.livePrefillAt != null
               ? `${state.livePromptTokens != null ? state.livePromptTokens.toLocaleString() + " tok · " : ""}${timeAgo(state.livePrefillAt)}`
               : "waiting for prompt",
         }),
@@ -471,7 +545,11 @@ function LlamaMonitor() {
           key: "c3",
           label: "Active Model",
           value: state.currentModel || "--",
-          sub: state.currentModel ? "via modelStatus" : "no model loaded",
+          sub: state.currentModel
+            ? "via modelStatus"
+            : state.modelKnown
+            ? "no model loaded"
+            : "waiting for modelStatus",
         }),
       ]
     )
